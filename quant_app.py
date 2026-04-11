@@ -15,8 +15,19 @@ import time
 import os
 import io
 
-matplotlib.rcParams["font.family"] = "Arial Unicode MS"
+import platform
+if platform.system() == "Darwin":
+    matplotlib.rcParams["font.family"] = "Arial Unicode MS"
+else:
+    matplotlib.rcParams["font.family"] = "DejaVu Sans"
 os.makedirs("data", exist_ok=True)
+
+STRATEGY_EN = {
+    "双均线": "MA Crossover",
+    "RSI":    "RSI",
+    "布林带": "Bollinger",
+    "MACD":   "MACD",
+}
 
 # =============================================================================
 # 数据函数
@@ -298,7 +309,7 @@ def plot_ma(code, nav_s, fast, slow):
     axes[0].plot(df["close"], label="收盘价", color="#2196F3", linewidth=1)
     axes[0].plot(df["close"].rolling(fast).mean(), label=f"MA{fast}", color="#FF9800", linewidth=1)
     axes[0].plot(df["close"].rolling(slow).mean(), label=f"MA{slow}", color="#F44336", linewidth=1)
-    axes[0].set_title(f"{code} 双均线策略（MA{fast}/MA{slow}）", fontsize=13)
+    axes[0].set_title(f"{code} MA Crossover (MA{fast}/MA{slow})", fontsize=13)
     axes[0].legend(fontsize=9); axes[0].grid(alpha=0.3)
     axes[1].plot(nav_s / nav_s.iloc[0], color="#4CAF50", linewidth=1.5, label="策略净值")
     axes[1].axhline(1, color="gray", linestyle="--", linewidth=0.8)
@@ -317,7 +328,7 @@ def plot_rsi(code, nav_s, rsi_buy, rsi_sell):
     fig, axes = plt.subplots(3, 1, figsize=(14, 10),
                               gridspec_kw={"height_ratios": [3, 1, 1]})
     axes[0].plot(df["close"], label="收盘价", color="#2196F3", linewidth=1)
-    axes[0].set_title(f"{code} RSI策略（买入<{rsi_buy} / 卖出>{rsi_sell}）", fontsize=13)
+    axes[0].set_title(f"{code} RSI Strategy (Buy<{rsi_buy} / Sell>{rsi_sell})", fontsize=13)
     axes[0].legend(fontsize=9); axes[0].grid(alpha=0.3)
     axes[1].plot(nav_s / nav_s.iloc[0], color="#4CAF50", linewidth=1.5, label="策略净值")
     axes[1].axhline(1, color="gray", linestyle="--", linewidth=0.8)
@@ -342,7 +353,7 @@ def plot_boll(code, nav_s):
     axes[0].plot(df["bb_mid"],   label="中轨",   color="#FF9800", linewidth=1, linestyle="--")
     axes[0].plot(df["bb_lower"], label="下轨",   color="#4CAF50", linewidth=1, linestyle="--")
     axes[0].fill_between(df.index, df["bb_upper"], df["bb_lower"], alpha=0.08, color="gray")
-    axes[0].set_title(f"{code} 布林带策略", fontsize=13)
+    axes[0].set_title(f"{code} Bollinger Band Strategy", fontsize=13)
     axes[0].legend(fontsize=9); axes[0].grid(alpha=0.3)
     axes[1].plot(nav_s / nav_s.iloc[0], color="#4CAF50", linewidth=1.5, label="策略净值")
     axes[1].axhline(1, color="gray", linestyle="--", linewidth=0.8)
@@ -357,7 +368,7 @@ def plot_macd(code, nav_s):
     fig, axes = plt.subplots(3, 1, figsize=(14, 10),
                               gridspec_kw={"height_ratios": [3, 1, 1]})
     axes[0].plot(df["close"], label="收盘价", color="#2196F3", linewidth=1)
-    axes[0].set_title(f"{code} MACD策略", fontsize=13)
+    axes[0].set_title(f"{code} MACD Strategy", fontsize=13)
     axes[0].legend(fontsize=9); axes[0].grid(alpha=0.3)
     axes[1].plot(nav_s / nav_s.iloc[0], color="#4CAF50", linewidth=1.5, label="策略净值")
     axes[1].axhline(1, color="gray", linestyle="--", linewidth=0.8)
@@ -545,7 +556,7 @@ if run_btn:
         for c, nav_s in all_navs.items():
             ax.plot(nav_s / nav_s.iloc[0], label=c, linewidth=1.5)
         ax.axhline(1, color="gray", linestyle="--", linewidth=0.8)
-        ax.set_title(f"多股净值曲线对比（{sname}策略）", fontsize=13)
+        ax.set_title(f"Multi-Stock NAV Comparison ({sname})", fontsize=13)
         ax.legend(); ax.grid(alpha=0.3)
         plt.tight_layout()
         st.image(_fig_to_buf(fig), width="stretch")
@@ -555,13 +566,71 @@ if run_btn:
         codes_show = compare_df["股票代码"].tolist()
         axes2[0].bar(codes_show, compare_df["总收益率(%)"],
                      color=["#4CAF50" if v>0 else "#F44336" for v in compare_df["总收益率(%)"]])
-        axes2[0].set_title("总收益率(%)"); axes2[0].grid(alpha=0.3, axis="y")
+        axes2[0].set_title("Total Return (%)"); axes2[0].grid(alpha=0.3, axis="y")
         axes2[1].bar(codes_show, compare_df["夏普比率"], color="#2196F3")
-        axes2[1].set_title("夏普比率"); axes2[1].grid(alpha=0.3, axis="y")
+        axes2[1].set_title("Sharpe Ratio"); axes2[1].grid(alpha=0.3, axis="y")
         axes2[2].bar(codes_show, compare_df["最大回撤(%)"], color="#FF9800")
-        axes2[2].set_title("最大回撤(%)"); axes2[2].grid(alpha=0.3, axis="y")
+        axes2[2].set_title("Max Drawdown (%)"); axes2[2].grid(alpha=0.3, axis="y")
         plt.tight_layout()
         st.image(_fig_to_buf(fig2), width="stretch")
+
+        # 多股多策略矩阵对比
+        st.subheader("🔢 多股 × 多策略矩阵对比")
+        st.caption("对所有股票同时运行四种策略，找出最优组合")
+        matrix_results = []
+        strategy_funcs = {
+            "MA":       lambda c: backtest_ma(c, stop_loss=stop_loss, take_profit=take_profit),
+            "RSI":      lambda c: backtest_rsi(c, stop_loss=stop_loss, take_profit=take_profit),
+            "Bollinger":lambda c: backtest_boll(c, stop_loss=stop_loss, take_profit=take_profit),
+            "MACD":     lambda c: backtest_macd(c, stop_loss=stop_loss, take_profit=take_profit),
+        }
+        with st.spinner("运行矩阵对比中（股票数 × 4策略）..."):
+            for c in codes_list:
+                row = {"股票": c}
+                for skey, sfunc in strategy_funcs.items():
+                    try:
+                        _, _, st_ = sfunc(c)
+                        row[f"{skey}_收益"] = st_["total_ret"]
+                        row[f"{skey}_夏普"] = st_["sharpe"]
+                    except:
+                        row[f"{skey}_收益"] = None
+                        row[f"{skey}_夏普"] = None
+                matrix_results.append(row)
+
+        matrix_df = pd.DataFrame(matrix_results).set_index("股票")
+
+        # 夏普比率热力图
+        sharpe_cols = [c for c in matrix_df.columns if "夏普" in c]
+        sharpe_mat  = matrix_df[sharpe_cols].copy()
+        sharpe_mat.columns = ["MA", "RSI", "Bollinger", "MACD"]
+
+        fig3, ax3 = plt.subplots(figsize=(8, max(3, len(codes_list))))
+        im = ax3.imshow(sharpe_mat.values.astype(float), cmap="RdYlGn", aspect="auto")
+        ax3.set_xticks(range(4)); ax3.set_xticklabels(["MA","RSI","Bollinger","MACD"])
+        ax3.set_yticks(range(len(codes_list))); ax3.set_yticklabels(codes_list)
+        for i in range(len(codes_list)):
+            for j in range(4):
+                val = sharpe_mat.values[i, j]
+                if val is not None and not np.isnan(float(val)):
+                    ax3.text(j, i, f"{float(val):.2f}", ha="center", va="center",
+                             fontsize=11, fontweight="bold",
+                             color="white" if abs(float(val)) > 0.6 else "black")
+        plt.colorbar(im, ax=ax3, label="Sharpe Ratio")
+        ax3.set_title("Sharpe Ratio Heatmap: Stock × Strategy", fontsize=13)
+        plt.tight_layout()
+        st.image(_fig_to_buf(fig3), width="stretch")
+
+        # 找出最优组合
+        best_val, best_stock, best_strat = -999, "", ""
+        for c in codes_list:
+            row = matrix_df.loc[c]
+            for skey in ["MA","RSI","Bollinger","MACD"]:
+                val = row.get(f"{skey}_夏普")
+                if val is not None and not np.isnan(float(val)) and float(val) > best_val:
+                    best_val   = float(val)
+                    best_stock = c
+                    best_strat = skey
+        st.success(f"🥇 全局最优组合：**{best_stock}** × **{best_strat}策略**（夏普比率 {best_val:.3f}）")
 
         st.subheader("🤖 AI 智能分析")
         if api_key:
