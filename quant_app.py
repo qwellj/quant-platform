@@ -911,11 +911,18 @@ if page == "📊 策略回测":
         img_main_buf = _fig_to_buf(fig_main)
         img_main_buf.seek(0)
         st.image(img_main_buf, width="stretch")
+        st.session_state["img_main"] = img_main_buf.getvalue()
 
         st.subheader("📊 基准对比 & 年度收益")
         img_bench_buf = _fig_to_buf(fig_bench)
         img_bench_buf.seek(0)
         st.image(img_bench_buf, width="stretch")
+        st.session_state["img_bench"] = img_bench_buf.getvalue()
+        st.session_state["pdf_meta"]  = {
+            "code": code, "stock_name": stock_name,
+            "strategy_name": strategy_name,
+            "stats": stats, "annual": annual.to_dict()
+        }
 
         if len(trades_df) > 0:
             st.subheader("📋 交易记录（最近20笔）")
@@ -942,19 +949,24 @@ if page == "📊 策略回测":
         st.divider()
         st.subheader("📄 导出 PDF 报告")
         if st.button("生成 PDF 报告", type="secondary"):
-            with st.spinner("正在生成 PDF..."):
-                img_main_buf.seek(0)
-                img_bench_buf.seek(0)
-                pdf_buf = generate_pdf(
-                    code, stock_name, strategy_name, stats, annual,
-                    img_main_buf, img_bench_buf
+            if "img_main" not in st.session_state:
+                st.error("请先完成回测分析，再生成PDF")
+            else:
+                with st.spinner("正在生成 PDF..."):
+                    meta = st.session_state["pdf_meta"]
+                    pdf_buf = generate_pdf(
+                        meta["code"], meta["stock_name"],
+                        meta["strategy_name"], meta["stats"],
+                        pd.Series(meta["annual"]),
+                        io.BytesIO(st.session_state["img_main"]),
+                        io.BytesIO(st.session_state["img_bench"])
+                    )
+                st.download_button(
+                    label="⬇️ 下载 PDF 报告",
+                    data=pdf_buf,
+                    file_name=f"{meta['code']}_{meta['strategy_name']}_report.pdf",
+                    mime="application/pdf"
                 )
-            st.download_button(
-                label="⬇️ 下载 PDF 报告",
-                data=pdf_buf,
-                file_name=f"{code}_{strategy_name}_report.pdf",
-                mime="application/pdf"
-            )
 
     else:
         st.info("👈 在左侧设置参数，点击「开始分析」")
