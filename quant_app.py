@@ -966,21 +966,6 @@ elif page == "🔍 选股中心":
     else:
         pe_max = 35; pb_min = 1; pb_max = 8; cap_min = 200; cap_max = 3000; ret_60d_min = 0
 
-    # ── 仅技术面：自定义股票池 ──
-    if screen_mode == "📈 仅技术面选股":
-        st.divider()
-        st.markdown("#### 📋 待分析股票池")
-        st.caption("输入待扫描的股票代码，每行一个（最多100只）")
-        manual_input = st.text_area(
-            "股票代码", value="600519\n000858\n601899\n000333\n600036",
-            height=160, label_visibility="collapsed"
-        )
-        manual_codes = [c.strip() for c in manual_input.strip().split("\n")
-                        if c.strip() and c.strip().isdigit()][:100]
-        st.caption(f"已输入 **{len(manual_codes)}** 只股票")
-    else:
-        manual_codes = []
-
     # ── 技术面参数 ──
     if screen_mode in ["📈 仅技术面选股", "🔀 基本面 + 技术面联合选股"]:
         st.divider()
@@ -993,10 +978,8 @@ elif page == "🔍 选股中心":
             require_vol= st.checkbox("必须满足放量突破信号", value=False)
         with c2:
             no_diverge = st.checkbox("排除顶背离预警股票", value=True)
-            if screen_mode == "🔀 基本面 + 技术面联合选股":
-                max_stocks = st.slider("基本面结果中最多分析前N只", 10, 100, 30, 10)
-            else:
-                max_stocks = len(manual_codes) if manual_codes else 50
+            max_stocks = st.slider("最多分析前N只股票", 10, 200, 50, 10,
+                                   help="技术面逐只下载行情，建议不超过100只")
         with st.expander("📖 5个技术信号说明"):
             st.markdown("""
 | 信号 | 触发条件 |
@@ -1080,25 +1063,33 @@ elif page == "🔍 选股中心":
 
         # ── 模式B：仅技术面 ──
         elif screen_mode == "📈 仅技术面选股":
-            if not manual_codes:
-                st.error("请先输入至少一只股票代码"); st.stop()
-            st.subheader(f"📈 对 {len(manual_codes)} 只股票进行技术面分析")
+            with st.status("📥 获取全市场股票列表（约30秒）...", expanded=True) as status:
+                try:
+                    df_all   = get_fundamental_data()
+                    all_codes = df_all["code"].tolist()
+                    st.write(f"✅ 共获取 {len(all_codes)} 只股票")
+                    status.update(label="股票列表获取完成", state="complete")
+                except Exception as e:
+                    status.update(label=f"获取失败: {e}", state="error"); st.error(str(e)); st.stop()
+
+            candidates = all_codes[:max_stocks]
+            st.subheader(f"📈 对全市场前 {len(candidates)} 只股票进行技术面分析")
             tech_results = []
             progress = st.progress(0, text="技术面分析中...")
-            for idx, code in enumerate(manual_codes):
+            for idx, code in enumerate(candidates):
                 res = technical_screen(code)
                 if res:
                     tech_results.append(res)
-                progress.progress((idx+1)/len(manual_codes),
-                                   text=f"分析中 {idx+1}/{len(manual_codes)}: {code}")
+                progress.progress((idx+1)/len(candidates),
+                                   text=f"分析中 {idx+1}/{len(candidates)}: {code}")
                 time.sleep(0.3)
             progress.empty()
             if not tech_results:
-                st.warning("所有股票技术面分析失败，请检查网络或代码")
+                st.warning("所有股票技术面分析失败，请检查网络")
             else:
                 tech_df = pd.DataFrame(tech_results)
                 show    = _show_tech(tech_df)
-                st.success(f"📈 分析 {len(manual_codes)} 只 → 通过 **{len(show)}** 只")
+                st.success(f"📈 分析 {len(candidates)} 只 → 通过 **{len(show)}** 只")
                 st.dataframe(show, hide_index=True, use_container_width=True)
                 if len(show) > 0:
                     st.info(f"💡 TOP6 可复制到「策略回测」：\n```\n" +
