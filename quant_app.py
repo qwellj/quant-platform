@@ -466,8 +466,8 @@ def generate_pdf(code, stock_name, strategy_name, stats, annual,
         ax0.text(0.5, 0.55, f"Strategy: {strategy_name}",
                  ha="center", va="center", fontsize=18,
                  transform=ax0.transAxes, color="#37474F")
-        ax0.axhline(0.48, xmin=0.15, xmax=0.85, color="#BBDEFB", linewidth=1.5,
-                    transform=ax0.transAxes)
+        ax0.plot([0.15, 0.85], [0.48, 0.48], color="#BBDEFB", linewidth=1.5,
+                 transform=ax0.transAxes)
         metrics = [
             ("Total Return",  f"{stats['total_ret']}%"),
             ("Sharpe Ratio",  f"{stats['sharpe']}"),
