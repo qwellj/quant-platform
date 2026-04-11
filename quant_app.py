@@ -613,6 +613,84 @@ def screen_stocks(df, pe_max=35, pb_min=1, pb_max=8,
     return result[["code","name","price","pe","pb","市值(亿)","ret_60d"]]
 
 
+def technical_screen(code, window=20):
+    """
+    技术面筛选：计算价量信号
+    返回包含各信号的字典
+    """
+    try:
+        prefix = "sh" if code.startswith("6") else "sz"
+        df = ak.stock_zh_a_daily(symbol=f"{prefix}{code}", adjust="qfq")
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.tail(60).copy()  # 只取最近60天
+        df.set_index("date", inplace=True)
+        if len(df) < window + 5:
+            return None
+
+        close  = df["close"]
+        volume = df["volume"]
+
+        # 均线多头排列
+        ma5  = close.rolling(5).mean()
+        ma10 = close.rolling(10).mean()
+        ma20 = close.rolling(20).mean()
+        ma_bullish = (ma5.iloc[-1] > ma10.iloc[-1] > ma20.iloc[-1])
+
+        # 放量突破：成交量 > N日均量的1.5倍且价格创N日新高
+        vol_avg      = volume.rolling(window).mean()
+        vol_breakout = (volume.iloc[-1] > vol_avg.iloc[-1] * 1.5) and \
+                       (close.iloc[-1] == close.rolling(window).max().iloc[-1])
+
+        # 价量背离（顶背离）：价格创新高但量能萎缩
+        price_new_high  = close.iloc[-1] == close.rolling(window).max().iloc[-1]
+        vol_below_avg   = volume.iloc[-1] < vol_avg.iloc[-1] * 0.7
+        top_divergence  = price_new_high and vol_below_avg
+
+        # 缩量整理后放量（金针探底型）：
+        # 前5日成交量低迷，最新一日放量
+        recent_vol_low  = volume.iloc[-6:-1].mean()
+        vol_surge       = volume.iloc[-1] > recent_vol_low * 2.0
+
+        # MACD 金叉
+        ema12      = close.ewm(span=12).mean()
+        ema26      = close.ewm(span=26).mean()
+        macd       = ema12 - ema26
+        signal     = macd.ewm(span=9).mean()
+        macd_cross = (macd.iloc[-2] < signal.iloc[-2]) and \
+                     (macd.iloc[-1] > signal.iloc[-1])
+
+        # RSI 超卖反弹
+        delta = close.diff()
+        gain  = delta.clip(lower=0).rolling(14).mean()
+        loss  = (-delta.clip(upper=0)).rolling(14).mean()
+        rsi   = (100 - (100 / (1 + gain / loss))).iloc[-1]
+        rsi_oversold_bounce = (rsi > 30) and (rsi < 50) and \
+                              (close.iloc[-1] > close.iloc[-3])
+
+        # 综合打分（满分5分）
+        score = sum([
+            ma_bullish,
+            vol_breakout,
+            not top_divergence,   # 无顶背离加分
+            macd_cross or vol_surge,
+            rsi_oversold_bounce
+        ])
+
+        return {
+            "code":                code,
+            "均线多头":            "✅" if ma_bullish        else "❌",
+            "放量突破":            "✅" if vol_breakout       else "❌",
+            "顶背离预警":          "⚠️" if top_divergence    else "✅",
+            "MACD金叉/缩量放量":   "✅" if (macd_cross or vol_surge) else "❌",
+            "RSI超卖反弹":         "✅" if rsi_oversold_bounce else "❌",
+            "技术评分":            f"{score}/5",
+            "RSI当前值":           round(rsi, 1),
+            "_score":              score,
+        }
+    except:
+        return None
+
+
 # =============================================================================
 # Streamlit 界面
 # =============================================================================
@@ -1011,23 +1089,51 @@ if st.session_state.get("show_pdf") or st.session_state.get("pdf_meta"):
 # 页面二：基本面选股
 # =========================================================================
 elif page == "🔍 基本面选股":
-    st.subheader("🔍 基本面选股")
-    st.caption("从全市场5800只股票中筛选估值合理、趋势向上的优质标的")
+    st.subheader("🔍 基本面 + 技术面双重选股")
+    st.caption("第一层：基本面筛选估值合理的股票  →  第二层：技术面筛选价量信号良好的标的")
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        pe_max    = st.slider("市盈率上限 (PE)", 10, 60, 35, 1)
-        pb_min    = st.slider("市净率下限 (PB)", 0, 3, 1, 1)
-    with col2:
-        pb_max    = st.slider("市净率上限 (PB)", 3, 20, 8, 1)
-        cap_min   = st.slider("市值下限 (亿)", 50, 500, 200, 50)
-    with col3:
-        cap_max   = st.slider("市值上限 (亿)", 500, 10000, 3000, 500)
-        ret_60d_min = st.slider("近60日涨幅下限 (%)", -20, 20, 0, 1)
+    # 两栏布局：基本面 + 技术面参数
+    tab1, tab2 = st.tabs(["📊 第一层：基本面筛选", "📈 第二层：技术面筛选"])
+
+    with tab1:
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            pe_max      = st.slider("市盈率上限 (PE)", 10, 60, 35, 1)
+            pb_min      = st.slider("市净率下限 (PB)", 0, 3, 1, 1)
+        with col2:
+            pb_max      = st.slider("市净率上限 (PB)", 3, 20, 8, 1)
+            cap_min     = st.slider("市值下限 (亿)", 50, 500, 200, 50)
+        with col3:
+            cap_max     = st.slider("市值上限 (亿)", 500, 10000, 3000, 500)
+            ret_60d_min = st.slider("近60日涨幅下限 (%)", -20, 20, 0, 1)
+
+    with tab2:
+        st.markdown("对基本面筛出的股票进行技术面二次过滤，每只股票计算5个信号，满分5分：")
+        col1, col2 = st.columns(2)
+        with col1:
+            use_tech    = st.checkbox("启用技术面筛选", value=True)
+            min_score   = st.slider("技术评分下限（分）", 1, 5, 3, 1,
+                                     help="只保留技术评分达到此分数的股票")
+            require_ma  = st.checkbox("必须满足均线多头排列", value=True)
+        with col2:
+            require_vol = st.checkbox("必须满足放量突破", value=False)
+            no_diverge  = st.checkbox("排除顶背离预警股票", value=True)
+            max_stocks  = st.slider("最多分析前N只股票", 10, 100, 30, 10,
+                                     help="技术面分析耗时较长，建议不超过50只")
+
+        st.info("""
+        **5个技术信号说明：**
+        - 🔵 **均线多头排列**：MA5 > MA10 > MA20，趋势向上
+        - 🔵 **放量突破**：成交量 > 20日均量1.5倍，且价格创20日新高
+        - 🔵 **无顶背离**：价格创新高时成交量未萎缩（健康上涨）
+        - 🔵 **MACD金叉 / 缩量放量**：动能信号出现
+        - 🔵 **RSI超卖反弹**：RSI从低位回升，有反弹动能
+        """)
 
     screen_btn = st.button("🔍 开始筛选", type="primary")
 
     if screen_btn:
+        # 第一层：基本面筛选
         with st.status("📥 获取全市场数据（约30秒）...", expanded=True) as status:
             try:
                 df_all = get_fundamental_data()
@@ -1038,32 +1144,108 @@ elif page == "🔍 基本面选股":
                 st.error(f"获取失败，请检查网络: {e}")
                 st.stop()
 
-        with st.status("🔍 筛选中...", expanded=True) as status:
+        with st.status("🔍 基本面筛选中...", expanded=True) as status:
             result = screen_stocks(df_all, pe_max=pe_max, pb_min=pb_min,
                                    pb_max=pb_max, cap_min=cap_min,
                                    cap_max=cap_max, ret_60d_min=ret_60d_min)
-            st.write(f"✅ 筛选完成，共 {len(result)} 只")
-            status.update(label=f"筛选完成：{len(result)} 只", state="complete")
+            st.write(f"✅ 基本面筛选完成，共 {len(result)} 只")
+            status.update(label=f"基本面筛选：{len(result)} 只", state="complete")
 
         st.divider()
-        st.subheader(f"📋 筛选结果（共 {len(result)} 只）")
+        st.subheader(f"📋 第一层结果：基本面筛选（{len(result)} 只）")
         st.dataframe(result, hide_index=True, width="stretch")
 
-        # 快捷操作：一键复制股票代码到回测
-        codes_str = "\n".join(result["code"].head(6).tolist())
-        st.info(f"💡 可将以下代码复制到「策略回测」的多股对比输入框：\n```\n{codes_str}\n```")
+        # 基本面分布图
+        fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+        pe_bins = [0, 10, 15, 20, 25, 30, 35]
+        axes[0].hist(result["pe"].dropna(), bins=pe_bins,
+                     color="#2196F3", edgecolor="white")
+        axes[0].set_title("PE Distribution", fontsize=12)
+        axes[0].set_xlabel("PE Ratio"); axes[0].grid(alpha=0.3, axis="y")
+        axes[1].scatter(result["pe"], result["ret_60d"],
+                        alpha=0.6, color="#4CAF50", s=30)
+        axes[1].set_xlabel("PE Ratio")
+        axes[1].set_ylabel("60-Day Return (%)")
+        axes[1].set_title("PE vs 60-Day Return", fontsize=12)
+        axes[1].grid(alpha=0.3)
+        plt.tight_layout()
+        st.image(_fig_to_buf(fig), width="stretch")
 
-        # 行业分布图
-        if len(result) > 0:
-            fig, axes = plt.subplots(1, 2, figsize=(14, 4))
-            pe_bins = [0, 10, 15, 20, 25, 30, 35]
-            axes[0].hist(result["pe"].dropna(), bins=pe_bins, color="#2196F3", edgecolor="white")
-            axes[0].set_title("PE Distribution", fontsize=12)
-            axes[0].set_xlabel("PE Ratio"); axes[0].grid(alpha=0.3, axis="y")
-            axes[1].scatter(result["pe"], result["ret_60d"],
-                            alpha=0.6, color="#4CAF50", s=30)
-            axes[1].set_xlabel("PE Ratio"); axes[1].set_ylabel("60-Day Return (%)")
-            axes[1].set_title("PE vs 60-Day Return", fontsize=12)
-            axes[1].grid(alpha=0.3)
-            plt.tight_layout()
-            st.image(_fig_to_buf(fig), width="stretch")
+        # 第二层：技术面筛选
+        if use_tech and len(result) > 0:
+            st.divider()
+            st.subheader("📈 第二层：技术面筛选")
+
+            candidates = result["code"].head(max_stocks).tolist()
+            tech_results = []
+
+            progress = st.progress(0, text="技术面分析中...")
+            for idx, code in enumerate(candidates):
+                res = technical_screen(code)
+                if res:
+                    tech_results.append(res)
+                progress.progress((idx + 1) / len(candidates),
+                                  text=f"分析中 {idx+1}/{len(candidates)}: {code}")
+                time.sleep(0.5)
+            progress.empty()
+
+            if not tech_results:
+                st.warning("技术面分析失败，请检查网络")
+            else:
+                tech_df = pd.DataFrame(tech_results)
+
+                # 按条件过滤
+                filtered = tech_df[tech_df["_score"] >= min_score].copy()
+                if require_ma:
+                    filtered = filtered[filtered["均线多头"] == "✅"]
+                if require_vol:
+                    filtered = filtered[filtered["放量突破"] == "✅"]
+                if no_diverge:
+                    filtered = filtered[filtered["顶背离预警"] == "✅"]
+                filtered = filtered.sort_values("_score", ascending=False)
+
+                # 合并基本面信息
+                final = filtered.merge(
+                    result[["code","name","price","pe","pb","ret_60d"]],
+                    on="code", how="left"
+                )
+                display_cols = ["code","name","price","pe","pb","ret_60d",
+                                "均线多头","放量突破","顶背离预警",
+                                "MACD金叉/缩量放量","RSI超卖反弹",
+                                "技术评分","RSI当前值"]
+                final_display = final[[c for c in display_cols if c in final.columns]]
+
+                st.success(f"🎯 双重筛选完成！基本面{len(result)}只 → 技术面分析{len(candidates)}只 → 最终入选 **{len(final_display)}** 只")
+                st.dataframe(final_display, hide_index=True, width="stretch")
+
+                # 技术评分分布图
+                if len(tech_df) > 0:
+                    fig2, axes2 = plt.subplots(1, 2, figsize=(14, 4))
+                    score_counts = tech_df["_score"].value_counts().sort_index()
+                    axes2[0].bar(score_counts.index.astype(str),
+                                 score_counts.values, color="#9C27B0")
+                    axes2[0].set_title("Technical Score Distribution", fontsize=12)
+                    axes2[0].set_xlabel("Score (out of 5)")
+                    axes2[0].grid(alpha=0.3, axis="y")
+
+                    axes2[1].scatter(tech_df["RSI当前值"],
+                                     tech_df["_score"],
+                                     alpha=0.6, color="#FF9800", s=50)
+                    axes2[1].axvline(30, color="green", linestyle="--",
+                                     linewidth=1, label="Oversold 30")
+                    axes2[1].axvline(70, color="red", linestyle="--",
+                                     linewidth=1, label="Overbought 70")
+                    axes2[1].set_xlabel("RSI Value")
+                    axes2[1].set_ylabel("Technical Score")
+                    axes2[1].set_title("RSI vs Technical Score", fontsize=12)
+                    axes2[1].legend(fontsize=9); axes2[1].grid(alpha=0.3)
+                    plt.tight_layout()
+                    st.image(_fig_to_buf(fig2), width="stretch")
+
+                # 快捷操作
+                if len(final_display) > 0:
+                    codes_str = "\n".join(final_display["code"].head(6).tolist())
+                    st.info(f"💡 双重筛选TOP6，可复制到「策略回测」多股对比：\n```\n{codes_str}\n```")
+        elif not use_tech:
+            codes_str = "\n".join(result["code"].head(6).tolist())
+            st.info(f"💡 基本面TOP6，可复制到「策略回测」多股对比：\n```\n{codes_str}\n```")
