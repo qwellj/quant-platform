@@ -948,25 +948,7 @@ if page == "📊 策略回测":
         # PDF 导出
         st.divider()
         st.subheader("📄 导出 PDF 报告")
-        if st.button("生成 PDF 报告", type="secondary"):
-            if "img_main" not in st.session_state:
-                st.error("请先完成回测分析，再生成PDF")
-            else:
-                with st.spinner("正在生成 PDF..."):
-                    meta = st.session_state["pdf_meta"]
-                    pdf_buf = generate_pdf(
-                        meta["code"], meta["stock_name"],
-                        meta["strategy_name"], meta["stats"],
-                        pd.Series(meta["annual"]),
-                        io.BytesIO(st.session_state["img_main"]),
-                        io.BytesIO(st.session_state["img_bench"])
-                    )
-                st.download_button(
-                    label="⬇️ 下载 PDF 报告",
-                    data=pdf_buf,
-                    file_name=f"{meta['code']}_{meta['strategy_name']}_report.pdf",
-                    mime="application/pdf"
-                )
+        st.session_state["show_pdf"] = True
 
     else:
         st.info("👈 在左侧设置参数，点击「开始分析」")
@@ -979,6 +961,31 @@ if page == "📊 策略回测":
             st.markdown("**📊 布林带**\n- 突破上轨买入\n- 跌破中轨卖出")
         with col4:
             st.markdown("**🏆 四策略对比**\n- 同时运行四个策略\n- AI推荐最优策略")
+
+# PDF 导出区域（始终可见，分析完成后激活）
+if st.session_state.get("show_pdf") or st.session_state.get("pdf_meta"):
+    st.divider()
+    st.subheader("📄 导出 PDF 报告")
+    if "pdf_meta" in st.session_state:
+        if st.button("生成 PDF 报告", type="secondary"):
+            with st.spinner("正在生成 PDF..."):
+                try:
+                    meta    = st.session_state["pdf_meta"]
+                    pdf_buf = generate_pdf(
+                        meta["code"], meta["stock_name"],
+                        meta["strategy_name"], meta["stats"],
+                        pd.Series(meta["annual"]),
+                        io.BytesIO(st.session_state["img_main"]),
+                        io.BytesIO(st.session_state["img_bench"])
+                    )
+                    st.download_button(
+                        label="⬇️ 下载 PDF 报告",
+                        data=pdf_buf,
+                        file_name=f"{meta['code']}_{meta['strategy_name']}_report.pdf",
+                        mime="application/pdf"
+                    )
+                except Exception as e:
+                    st.error(f"PDF生成失败: {e}")
 
 # =========================================================================
 # 页面二：基本面选股
