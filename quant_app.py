@@ -17,11 +17,33 @@ import os
 import io
 import time
 
-if platform.system() == "Darwin":
-    matplotlib.rcParams["font.family"] = "Arial Unicode MS"
-else:
-    matplotlib.rcParams["font.family"] = "DejaVu Sans"
-os.makedirs("data", exist_ok=True)
+import matplotlib.font_manager as fm
+
+def _set_chinese_font():
+    # 优先用系统已有的中文字体
+    candidates = [
+        "WenQuanYi Micro Hei", "WenQuanYi Zen Hei",
+        "Noto Sans CJK SC", "Noto Sans SC",
+        "Arial Unicode MS", "PingFang SC", "SimHei",
+    ]
+    available = {f.name for f in fm.fontManager.ttflist}
+    for name in candidates:
+        if name in available:
+            matplotlib.rcParams["font.family"] = name
+            return
+    # 都没有则下载 Noto（云端环境通用方案）
+    import urllib.request, os
+    font_path = "/tmp/NotoSansSC-Regular.ttf"
+    if not os.path.exists(font_path):
+        urllib.request.urlretrieve(
+            "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansSCRegular.otf",
+            font_path
+        )
+    fm.fontManager.addfont(font_path)
+    matplotlib.rcParams["font.family"] = "Noto Sans SC"
+
+_set_chinese_font()
+matplotlib.rcParams["axes.unicode_minus"] = False
 
 # =============================================================================
 # 工具函数
