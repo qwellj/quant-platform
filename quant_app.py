@@ -121,11 +121,23 @@ def calc_stats(nav, trades, initial_cash):
 
 
 def backtest_ma(code, fast=5, slow=40, initial_cash=1_000_000,
-                stop_loss=0.10, take_profit=0.30):
+                stop_loss=0.10, take_profit=0.30,
+                vol_filter=False, vol_mult=1.3,
+                macd_filter=False):
+    """
+    双均线策略回测。
+
+    新增过滤参数（两者可单独或同时开启）：
+        vol_filter  : 成交量过滤。金叉买入时要求成交量 > 20日均量 × vol_mult
+                      作用：排除缩量假突破，只在放量时入场
+        macd_filter : MACD方向过滤。买入时要求 MACD柱状图(hist) > 0
+                      作用：确认动能向上，避免"反弹中的死猫跳"
+    """
     df = pd.read_csv(f"data/{code}_indicators.csv",
                      index_col="date", parse_dates=True).dropna()
-    df["maf"] = df["close"].rolling(fast).mean()
-    df["mas"] = df["close"].rolling(slow).mean()
+    df["maf"]    = df["close"].rolling(fast).mean()
+    df["mas"]    = df["close"].rolling(slow).mean()
+    df["vol_ma"] = df["volume"].rolling(20).mean()   # 20日均量
     df = df.dropna()
     cash, position, buy_price = initial_cash, 0, 0
     nav, trades = [], []
@@ -146,11 +158,22 @@ def backtest_ma(code, fast=5, slow=40, initial_cash=1_000_000,
                 trades.append({"date": df.index[i], "action": "信号卖出", "price": price, "pnl_pct": round(pnl*100,2)})
                 position = 0
         elif df["maf"].iloc[i-1] < df["mas"].iloc[i-1] and df["maf"].iloc[i] > df["mas"].iloc[i]:
-            shares = int(cash / price / 100) * 100
-            if shares > 0:
-                cash -= shares * price * 1.001
-                position, buy_price = shares, price
-                trades.append({"date": df.index[i], "action": "买入", "price": price, "pnl_pct": 0})
+            # ── 过滤条件判断 ──
+            vol_ok  = (df["volume"].iloc[i] > df["vol_ma"].iloc[i] * vol_mult) if vol_filter  else True
+            macd_ok = (df["hist"].iloc[i] > 0)                                  if macd_filter else True
+
+            if vol_ok and macd_ok:
+                shares = int(cash / price / 100) * 100
+                if shares > 0:
+                    cash -= shares * price * 1.001
+                    position, buy_price = shares, price
+                    # 记录触发了哪些过滤条件
+                    filters = []
+                    if vol_filter:  filters.append(f"放量×{vol_mult}")
+                    if macd_filter: filters.append("MACD↑")
+                    tag = "+".join(filters) if filters else "无过滤"
+                    trades.append({"date": df.index[i], "action": "买入",
+                                   "price": price, "pnl_pct": 0, "filter": tag})
         nav.append(cash + position * price)
     nav_s, trades_df, stats = calc_stats(nav, trades, initial_cash)
     nav_s.index = df.index[1:]
@@ -586,19 +609,30 @@ def ai_analysis(code, strategy_name, stats, api_key, extra_info=""):
 # Walk-Forward 验证函数（新增）
 # =============================================================================
 
-def _wfv_run(price_s: pd.Series, fast: int, slow: int) -> dict:
-    """WFV内部回测（纯价格序列，不读文件）"""
+def _wfv_run(price_s: pd.Series, fast: int, slow: int,
+             vol_s: pd.Series = None, vol_filter: bool = False, vol_mult: float = 1.3,
+             hist_s: pd.Series = None, macd_filter: bool = False) -> dict:
+    """WFV内部回测（支持与backtest_ma相同的过滤条件）"""
     maf = price_s.rolling(fast).mean()
     mas = price_s.rolling(slow).mean()
     ok  = maf.notna() & mas.notna()
     maf, mas, ps = maf[ok], mas[ok], price_s[ok]
+
+    # 对齐可选序列
+    vol_ma = vol_s.rolling(20).mean()[ok] if (vol_filter and vol_s is not None) else None
+    vol_a  = vol_s[ok]                     if (vol_filter and vol_s is not None) else None
+    hist_a = hist_s[ok]                    if (macd_filter and hist_s is not None) else None
+
     cash, pos, nav = 1_000_000, 0, []
     for i in range(1, len(ps)):
         p = ps.iloc[i]
         if maf.iloc[i-1] < mas.iloc[i-1] and maf.iloc[i] >= mas.iloc[i] and pos == 0:
-            sh = int(cash / p / 100) * 100
-            if sh > 0:
-                cash -= sh * p * 1.001; pos = sh
+            vol_ok  = (vol_a.iloc[i] > vol_ma.iloc[i] * vol_mult) if vol_a  is not None else True
+            macd_ok = (hist_a.iloc[i] > 0)                         if hist_a is not None else True
+            if vol_ok and macd_ok:
+                sh = int(cash / p / 100) * 100
+                if sh > 0:
+                    cash -= sh * p * 1.001; pos = sh
         elif maf.iloc[i-1] > mas.iloc[i-1] and maf.iloc[i] <= mas.iloc[i] and pos > 0:
             cash += pos * p * 0.999; pos = 0
         nav.append(cash + pos * p)
@@ -614,43 +648,57 @@ def _wfv_run(price_s: pd.Series, fast: int, slow: int) -> dict:
     }
 
 
-def _wfv_optimize(price_s: pd.Series) -> tuple:
-    """在给定序列上网格搜索最优MA参数"""
+def _wfv_optimize(price_s: pd.Series,
+                  vol_s: pd.Series = None, vol_filter: bool = False, vol_mult: float = 1.3,
+                  hist_s: pd.Series = None, macd_filter: bool = False) -> tuple:
+    """在给定序列上网格搜索最优MA参数（支持过滤）"""
     best = (-999, 5, 40)
     for f, s in itertools.product([5, 10, 15, 20], [20, 30, 40, 60]):
         if f >= s:
             continue
-        r = _wfv_run(price_s, f, s)
+        r = _wfv_run(price_s, f, s, vol_s, vol_filter, vol_mult, hist_s, macd_filter)
         if r["sharpe"] > best[0]:
             best = (r["sharpe"], f, s)
     return best[1], best[2], best[0]
 
 
-def run_simple_split(code: str, train_end: str, test_start: str) -> dict:
+def run_simple_split(code: str, train_end: str, test_start: str,
+                     vol_filter=False, vol_mult=1.3, macd_filter=False) -> dict:
     """简单切割验证：训练集优化参数，测试集跑结果"""
-    ps    = pd.read_csv(f"data/{code}_indicators.csv",
-                        index_col="date", parse_dates=True)["close"].dropna()
-    train = ps[ps.index <= train_end]
-    test  = ps[ps.index >= test_start]
-    if len(train) < 60 or len(test) < 20:
+    df_all = pd.read_csv(f"data/{code}_indicators.csv",
+                         index_col="date", parse_dates=True).dropna()
+    ps    = df_all["close"]
+    vol_s = df_all["volume"]
+    hist_s= df_all["hist"]
+    train_ps  = ps[ps.index <= train_end]
+    test_ps   = ps[ps.index >= test_start]
+    train_vol = vol_s[vol_s.index <= train_end]
+    test_vol  = vol_s[vol_s.index >= test_start]
+    train_h   = hist_s[hist_s.index <= train_end]
+    test_h    = hist_s[hist_s.index >= test_start]
+    if len(train_ps) < 60 or len(test_ps) < 20:
         return {}
-    bf, bs, is_sh = _wfv_optimize(train)
-    oos           = _wfv_run(test, bf, bs)
+    bf, bs, is_sh = _wfv_optimize(train_ps, train_vol, vol_filter, vol_mult, train_h, macd_filter)
+    oos           = _wfv_run(test_ps, bf, bs, test_vol, vol_filter, vol_mult, test_h, macd_filter)
     decay         = oos["sharpe"] / is_sh if is_sh > 0 else 0
     return {
         "best_fast": bf, "best_slow": bs,
         "is_sharpe": round(is_sh, 3), "oos_sharpe": round(oos["sharpe"], 3),
         "oos_ret":   oos["total_ret"], "decay": round(decay, 3),
         "oos_nav":   oos["nav"],
-        "train_len": len(train), "test_len": len(test),
+        "train_len": len(train_ps), "test_len": len(test_ps),
     }
 
 
 def run_walk_forward(code: str, start_year: int, end_year: int,
-                     train_yrs: int = 3) -> dict:
+                     train_yrs: int = 3,
+                     vol_filter=False, vol_mult=1.3, macd_filter=False) -> dict:
     """滚动WFV：每年重新优化参数，拼接样本外净值"""
-    ps = pd.read_csv(f"data/{code}_indicators.csv",
-                     index_col="date", parse_dates=True)["close"].dropna()
+    df_all = pd.read_csv(f"data/{code}_indicators.csv",
+                         index_col="date", parse_dates=True).dropna()
+    ps     = df_all["close"]
+    vol_s  = df_all["volume"]
+    hist_s = df_all["hist"]
     rows, oos_pieces, is_sh_list, oos_sh_list = [], [], [], []
 
     yr = start_year
@@ -658,16 +706,19 @@ def run_walk_forward(code: str, start_year: int, end_year: int,
         t_end = f"{yr + train_yrs - 1}1231"
         v_st  = f"{yr + train_yrs}0101"
         v_end = f"{yr + train_yrs}1231"
-        train = ps[(ps.index >= f"{yr}0101") & (ps.index <= t_end)]
-        test  = ps[(ps.index >= v_st) & (ps.index <= v_end)]
-        if len(train) < 60 or len(test) < 20:
+        train_ps  = ps[(ps.index >= f"{yr}0101") & (ps.index <= t_end)]
+        test_ps   = ps[(ps.index >= v_st) & (ps.index <= v_end)]
+        train_vol = vol_s[(vol_s.index >= f"{yr}0101") & (vol_s.index <= t_end)]
+        test_vol  = vol_s[(vol_s.index >= v_st) & (vol_s.index <= v_end)]
+        train_h   = hist_s[(hist_s.index >= f"{yr}0101") & (hist_s.index <= t_end)]
+        test_h    = hist_s[(hist_s.index >= v_st) & (hist_s.index <= v_end)]
+        if len(train_ps) < 60 or len(test_ps) < 20:
             yr += 1; continue
 
-        bf, bs, is_sh = _wfv_optimize(train)
-        oos           = _wfv_run(test, bf, bs)
+        bf, bs, is_sh = _wfv_optimize(train_ps, train_vol, vol_filter, vol_mult, train_h, macd_filter)
+        oos           = _wfv_run(test_ps, bf, bs, test_vol, vol_filter, vol_mult, test_h, macd_filter)
         oos_sh        = oos["sharpe"]
 
-        # 链式拼接净值（归一化到前一段末尾）
         nav_piece = oos["nav"].copy()
         if oos_pieces:
             scale = oos_pieces[-1].iloc[-1] / 1_000_000
@@ -697,15 +748,15 @@ def run_walk_forward(code: str, start_year: int, end_year: int,
     win_rate = sum(s > 0 for s in oos_sh_list) / len(oos_sh_list)
 
     return {
-        "table":       pd.DataFrame(rows),
+        "table":        pd.DataFrame(rows),
         "oos_combined": oos_combined,
-        "mean_is":     round(mean_is, 3),
-        "mean_oos":    round(mean_oos, 3),
-        "decay":       round(decay, 3),
-        "win_rate":    win_rate,
-        "oos_sharpes": oos_sh_list,
-        "is_sharpes":  is_sh_list,
-        "test_years":  [r["测试年份"] for r in rows],
+        "mean_is":      round(mean_is, 3),
+        "mean_oos":     round(mean_oos, 3),
+        "decay":        round(decay, 3),
+        "win_rate":     win_rate,
+        "oos_sharpes":  oos_sh_list,
+        "is_sharpes":   is_sh_list,
+        "test_years":   [r["测试年份"] for r in rows],
     }
 
 
@@ -951,8 +1002,18 @@ if page == "📊 策略回测":
                 slow_ma = st.slider("慢线周期", 20, 60, 40, 5)
             else:
                 fast_ma, slow_ma = 5, 40
+
+            st.divider()
+            st.header("🔍 信号过滤")
+            vol_filter  = st.checkbox("成交量过滤", value=False,
+                                      help="金叉时成交量须大于20日均量N倍，排除缩量假突破")
+            vol_mult    = st.slider("成交量倍数", 1.0, 3.0, 1.3, 0.1,
+                                    disabled=not vol_filter)
+            macd_filter = st.checkbox("MACD方向过滤", value=False,
+                                      help="买入时要求MACD柱状图>0，确认动能向上")
         else:
             use_auto, fast_ma, slow_ma = True, 5, 40
+            vol_filter, vol_mult, macd_filter = False, 1.3, False
 
         if "RSI" in strategy:
             st.divider()
@@ -987,7 +1048,7 @@ if page == "📊 策略回测":
                                 bs  = int(opt.iloc[0]["slow"])
                             else:
                                 bf, bs = fast_ma, slow_ma
-                            nav_s, _, stats = backtest_ma(c, bf, bs, stop_loss=stop_loss, take_profit=take_profit)
+                            nav_s, _, stats = backtest_ma(c, bf, bs, stop_loss=stop_loss, take_profit=take_profit, vol_filter=vol_filter, vol_mult=vol_mult, macd_filter=macd_filter)
                             sname = f"MA{bf}/MA{bs}"
                         elif "RSI" in strategy:
                             nav_s, _, stats = backtest_rsi(c, rsi_buy, rsi_sell, stop_loss=stop_loss, take_profit=take_profit)
@@ -1042,7 +1103,7 @@ if page == "📊 策略回测":
             st.subheader("🔢 多股 × 多策略矩阵对比")
             matrix_results = []
             strategy_funcs = {
-                "MA":        lambda c: backtest_ma(c, stop_loss=stop_loss, take_profit=take_profit),
+                "MA":        lambda c: backtest_ma(c, stop_loss=stop_loss, take_profit=take_profit, vol_filter=vol_filter, vol_mult=vol_mult, macd_filter=macd_filter),
                 "RSI":       lambda c: backtest_rsi(c, stop_loss=stop_loss, take_profit=take_profit),
                 "Bollinger": lambda c: backtest_boll(c, stop_loss=stop_loss, take_profit=take_profit),
                 "MACD":      lambda c: backtest_macd(c, stop_loss=stop_loss, take_profit=take_profit),
@@ -1140,7 +1201,7 @@ if page == "📊 策略回测":
                     st.write(f"✅ 最优参数: MA{best_fast}/MA{best_slow}")
                 else:
                     best_fast, best_slow = fast_ma, slow_ma
-                nav_s, trades_df, stats = backtest_ma(code, best_fast, best_slow, stop_loss=stop_loss, take_profit=take_profit)
+                nav_s, trades_df, stats = backtest_ma(code, best_fast, best_slow, stop_loss=stop_loss, take_profit=take_profit, vol_filter=vol_filter, vol_mult=vol_mult, macd_filter=macd_filter)
                 fig_main      = plot_ma(code, nav_s, best_fast, best_slow)
                 strategy_name = f"MA Crossover MA{best_fast}/MA{best_slow}"
                 extra_info    = f"Best MA params: MA{best_fast}/MA{best_slow}"
@@ -1167,7 +1228,7 @@ if page == "📊 策略回测":
                 opt_df    = optimize_ma_params(code)
                 best_fast = int(opt_df.iloc[0]["fast"])
                 best_slow = int(opt_df.iloc[0]["slow"])
-                nav_ma,   _, stats_ma   = backtest_ma(code, best_fast, best_slow, stop_loss=stop_loss, take_profit=take_profit)
+                nav_ma,   _, stats_ma   = backtest_ma(code, best_fast, best_slow, stop_loss=stop_loss, take_profit=take_profit, vol_filter=vol_filter, vol_mult=vol_mult, macd_filter=macd_filter)
                 nav_rsi,  _, stats_rsi  = backtest_rsi(code, rsi_buy, rsi_sell, stop_loss=stop_loss, take_profit=take_profit)
                 nav_boll, _, stats_boll = backtest_boll(code, stop_loss=stop_loss, take_profit=take_profit)
                 nav_macd, _, stats_macd = backtest_macd(code, stop_loss=stop_loss, take_profit=take_profit)
@@ -1319,6 +1380,13 @@ elif page == "🔬 策略验证(WFV)":
         ic_col = st.selectbox("选择信号列", ["macd", "rsi", "hist"])
         ic_fwd = st.slider("预测未来N日收益", 5, 60, 20, 5)
 
+        st.divider()
+        st.header("🔍 信号过滤（验证用）")
+        wfv_vol_filter  = st.checkbox("成交量过滤", value=False, key="wfv_vf")
+        wfv_vol_mult    = st.slider("成交量倍数", 1.0, 3.0, 1.3, 0.1,
+                                    disabled=not wfv_vol_filter, key="wfv_vm")
+        wfv_macd_filter = st.checkbox("MACD方向过滤", value=False, key="wfv_mf")
+
         run_wfv = st.button("🚀 开始验证", type="primary", use_container_width=True)
 
     if run_wfv:
@@ -1343,7 +1411,8 @@ elif page == "🔬 策略验证(WFV)":
         with col_s:
             st.markdown("#### ✂️ 简单切割")
             with st.spinner("计算中..."):
-                spl = run_simple_split(code, train_end, test_start)
+                spl = run_simple_split(code, train_end, test_start,
+                                       wfv_vol_filter, wfv_vol_mult, wfv_macd_filter)
             if not spl:
                 st.warning("数据不足")
             else:
@@ -1374,7 +1443,8 @@ elif page == "🔬 策略验证(WFV)":
         with col_w:
             st.markdown("#### 🔄 Walk-Forward")
             with st.spinner("滚动验证中（较慢，请稍候）..."):
-                wfv = run_walk_forward(code, int(start_yr), int(end_yr), wfv_train_yrs)
+                wfv = run_walk_forward(code, int(start_yr), int(end_yr), wfv_train_yrs,
+                                       wfv_vol_filter, wfv_vol_mult, wfv_macd_filter)
 
             if not wfv:
                 st.warning("数据不足，无法进行WFV")
