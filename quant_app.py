@@ -17,12 +17,11 @@ import os
 import io
 import time
 
-import matplotlib.font_manager as fm
-
 if platform.system() == "Darwin":
     matplotlib.rcParams["font.family"] = "Arial Unicode MS"
 else:
     matplotlib.rcParams["font.family"] = "DejaVu Sans"
+os.makedirs("data", exist_ok=True)
 
 # =============================================================================
 # 工具函数
@@ -607,6 +606,245 @@ def ai_analysis(code, strategy_name, stats, api_key, extra_info=""):
 
 
 # =============================================================================
+# 月度因子回测函数（新增）
+# =============================================================================
+
+def batch_download_pool(codes: list, start: str, end: str) -> dict:
+    """
+    批量下载股票池历史价格，返回 {code: close_series}
+    失败的股票自动跳过，每只间隔0.3秒防限流
+    """
+    price_data = {}
+    for code in codes:
+        try:
+            prefix = "sh" if code.startswith("6") else "sz"
+            df = ak.stock_zh_a_daily(symbol=f"{prefix}{code}", adjust="qfq")
+            df["date"] = pd.to_datetime(df["date"])
+            df = df[(df["date"] >= pd.to_datetime(start)) &
+                    (df["date"] <= pd.to_datetime(end))]
+            df.set_index("date", inplace=True)
+            if len(df) > 120:           # 至少半年数据才入池
+                price_data[code] = df["close"]
+        except:
+            pass
+        time.sleep(0.3)
+    return price_data
+
+
+def score_stocks_at_date(price_data: dict, rebal_date: pd.Timestamp) -> pd.DataFrame:
+    """
+    在某个月末日期，对股票池里所有股票计算因子得分。
+
+    因子说明：
+        momentum_12_1：
+            = 12个月前收盘价 → 1个月前收盘价的涨幅
+            跳过最近1个月是为了规避"短期反转"效应
+            （刚大涨的股票短期内往往有回调，跳过1月可以避开这个噪声）
+            这是A股文献中最稳定的价格因子之一
+
+        trend_filter：
+            = 当前价格 > MA60（60日均线）
+            只选择趋势向上的股票，过滤掉下跌趋势中的"价值陷阱"
+            在均线因子失效的今天，这个过滤仍有一定的排除作用
+
+    返回：
+        DataFrame，columns=[momentum, trend, score]，index=股票代码
+    """
+    records = {}
+    for code, ps in price_data.items():
+        p = ps[ps.index <= rebal_date].dropna()
+        if len(p) < 252:                # 至少1年历史
+            continue
+
+        # 动量：12个月前(约252日)到1个月前(约21日)
+        p_12m = p.iloc[-252]
+        p_1m  = p.iloc[-21]
+        if p_12m <= 0:
+            continue
+        momentum = (p_1m / p_12m) - 1
+
+        # 趋势过滤
+        ma60  = p.rolling(60).mean().iloc[-1]
+        trend = 1 if p.iloc[-1] > ma60 else 0
+
+        records[code] = {"momentum": momentum, "trend": trend}
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records).T
+    df["mom_rank"] = df["momentum"].rank(pct=True)   # 百分位排名
+
+    # 综合得分：动量排名 × 趋势过滤
+    # trend=0 的股票得分为0，不会被选中
+    df["score"]   = df["mom_rank"] * df["trend"]
+    return df.sort_values("score", ascending=False)
+
+
+def backtest_factor_monthly(price_data: dict,
+                             start_date: str,
+                             end_date:   str,
+                             n_stocks:   int   = 20,
+                             initial_cash: float = 1_000_000) -> tuple:
+    """
+    月度调仓因子回测引擎
+
+    逻辑：
+        每个月末 → 计算因子得分 → 选前n_stocks只
+        → 卖掉不在新选股里的 → 买入新增股票（等权）
+        → 持有到下月末 → 循环
+
+    手续费：买入0.1%，卖出0.1%（含印花税）
+    持仓：等权，即每只股票分配相同金额
+
+    注意：月度换仓每年约12次，远少于均线策略的30-40次
+    换手率低 → 手续费少 → 策略净收益更真实
+    """
+    # 生成月末再平衡日期序列
+    all_month_ends = pd.date_range(start_date, end_date, freq="ME")
+    if len(all_month_ends) < 3:
+        return pd.Series(dtype=float), [], pd.DataFrame()
+
+    # 合并所有股票价格为宽表（日期 x 股票）
+    price_df = pd.DataFrame(price_data).sort_index()
+
+    cash        = initial_cash
+    holdings    = {}        # {code: shares}
+    nav_records = []
+    rebal_log   = []
+
+    for i in range(len(all_month_ends) - 1):
+        rebal_date = all_month_ends[i]
+        next_date  = all_month_ends[i + 1]
+
+        # ── 当月末：计算得分，决定新持仓 ──
+        scores = score_stocks_at_date(price_data, rebal_date)
+        if scores.empty:
+            continue
+
+        new_selection = scores.head(n_stocks).index.tolist()
+
+        # 卖出不在新选股里的（月末收盘价成交）
+        to_sell = [c for c in list(holdings.keys()) if c not in new_selection]
+        for code in to_sell:
+            if code in price_df.columns:
+                idx = price_df.index.get_indexer([rebal_date], method="ffill")[0]
+                if idx >= 0:
+                    sell_px = price_df.iloc[idx][code]
+                    if not pd.isna(sell_px) and sell_px > 0:
+                        cash += holdings[code] * sell_px * 0.999
+            del holdings[code]
+
+        # 买入新增的股票（等权分配剩余现金）
+        to_buy   = [c for c in new_selection if c not in holdings]
+        n_buy    = len(to_buy)
+        if n_buy > 0 and cash > 1000:
+            per_amt = cash * 0.99 / n_buy     # 留1%现金缓冲
+            for code in to_buy:
+                if code not in price_df.columns:
+                    continue
+                idx = price_df.index.get_indexer([rebal_date], method="ffill")[0]
+                if idx < 0:
+                    continue
+                buy_px = price_df.iloc[idx][code]
+                if pd.isna(buy_px) or buy_px <= 0:
+                    continue
+                shares = int(per_amt / buy_px / 100) * 100
+                if shares > 0:
+                    cost = shares * buy_px * 1.001
+                    if cost <= cash:
+                        cash -= cost
+                        holdings[code] = shares
+
+        # 记录换仓情况
+        rebal_log.append({
+            "换仓日":   rebal_date.strftime("%Y-%m"),
+            "新选股":   ", ".join(new_selection[:5]) + ("..." if len(new_selection) > 5 else ""),
+            "持仓只数": len(holdings),
+            "现金余额": round(cash, 0),
+        })
+
+        # ── 当月：逐日计算净值 ──
+        period_idx = price_df[(price_df.index > rebal_date) &
+                               (price_df.index <= next_date)].index
+        for d in period_idx:
+            pv = cash
+            for code, sh in holdings.items():
+                if code in price_df.columns:
+                    px = price_df.loc[d, code]
+                    if not pd.isna(px):
+                        pv += sh * px
+            nav_records.append({"date": d, "nav": pv})
+
+    if not nav_records:
+        return pd.Series(dtype=float), rebal_log, pd.DataFrame()
+
+    nav_s   = pd.DataFrame(nav_records).set_index("date")["nav"]
+    rebal_df = pd.DataFrame(rebal_log)
+    return nav_s, rebal_log, rebal_df
+
+
+def plot_factor_result(nav_s: pd.Series, benchmark: pd.Series,
+                       rebal_df: pd.DataFrame, n_stocks: int) -> bytes:
+    """生成因子回测三合一图表"""
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    # 图1：策略净值 vs 沪深300
+    ax1 = axes[0]
+    nav_norm = nav_s / nav_s.iloc[0]
+    ax1.plot(nav_norm, color="#1D9E75", linewidth=1.5,
+             label=f"因子策略(Top{n_stocks})")
+    ax1.fill_between(nav_norm.index, nav_norm, 1,
+                     where=(nav_norm < 1), alpha=0.15, color="#E24B4A")
+    if benchmark is not None:
+        bm = benchmark.reindex(nav_s.index, method="ffill").dropna()
+        if len(bm) > 0:
+            bm_norm = bm / bm.iloc[0]
+            ax1.plot(bm_norm, color="#378ADD", linewidth=1.2,
+                     linestyle="--", label="沪深300")
+    ax1.axhline(1, color="gray", linestyle=":", linewidth=0.8)
+    ax1.set_title("策略净值 vs 基准", fontsize=11)
+    ax1.legend(fontsize=8); ax1.grid(alpha=0.3)
+
+    # 图2：年度收益柱状图
+    ax2 = axes[1]
+    annual = {}
+    for yr in nav_s.index.year.unique():
+        yr_nav = nav_s[nav_s.index.year == yr]
+        if len(yr_nav) > 2:
+            annual[yr] = round((yr_nav.iloc[-1] / yr_nav.iloc[0] - 1) * 100, 1)
+    if annual:
+        yrs    = list(annual.keys())
+        vals   = list(annual.values())
+        colors = ["#1D9E75" if v >= 0 else "#E24B4A" for v in vals]
+        bars   = ax2.bar([str(y) for y in yrs], vals, color=colors, alpha=0.8)
+        ax2.axhline(0, color="gray", linewidth=0.8)
+        for bar, v in zip(bars, vals):
+            ax2.text(bar.get_x() + bar.get_width()/2,
+                     bar.get_height() + (0.5 if v >= 0 else -2),
+                     f"{v:.1f}%", ha="center", va="bottom", fontsize=8)
+    ax2.set_title("年度收益", fontsize=11)
+    ax2.grid(alpha=0.3, axis="y")
+
+    # 图3：回撤曲线
+    ax3 = axes[2]
+    nav_norm2 = nav_s / nav_s.iloc[0]
+    drawdown  = (nav_norm2 - nav_norm2.cummax()) / nav_norm2.cummax() * 100
+    ax3.fill_between(drawdown.index, drawdown, 0,
+                     alpha=0.4, color="#E24B4A", label="回撤")
+    ax3.plot(drawdown, color="#E24B4A", linewidth=0.8)
+    ax3.set_title("回撤曲线", fontsize=11)
+    ax3.set_ylabel("%"); ax3.grid(alpha=0.3)
+
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=130)
+    buf.seek(0)
+    plt.close(fig)
+    return buf.read()
+
+
+# =============================================================================
 # Walk-Forward 验证函数（新增）
 # =============================================================================
 
@@ -953,11 +1191,11 @@ def technical_screen(code, window=20):
 # =============================================================================
 
 st.set_page_config(page_title="量化投资分析平台", page_icon="📈", layout="wide")
-st.title("📈 量化投资分析平台 v4.0")
-st.caption("策略回测 · 基准对比 · 年度收益 · Walk-Forward验证 · 基本面选股 · PDF报告导出")
+st.title("📈 量化投资分析平台 v6.0")
+st.caption("策略回测 · Walk-Forward验证 · 月度因子回测 · 基本面选股 · PDF报告导出")
 
 # 顶部页面导航
-page = st.radio("", ["📊 策略回测", "🔬 策略验证(WFV)", "🔍 基本面选股"], horizontal=True, label_visibility="collapsed")
+page = st.radio("", ["📊 策略回测", "🔬 策略验证(WFV)", "📅 因子回测", "🔍 基本面选股"], horizontal=True, label_visibility="collapsed")
 st.divider()
 
 # =========================================================================
@@ -1351,6 +1589,186 @@ if st.session_state.get("show_pdf") or st.session_state.get("pdf_meta"):
                     )
                 except Exception as e:
                     st.error(f"PDF生成失败: {e}")
+
+# =========================================================================
+# 页面：月度因子回测
+# =========================================================================
+elif page == "📅 因子回测":
+    st.subheader("📅 月度调仓因子回测")
+    st.caption("基于动量因子 + 趋势过滤，每月末自动换仓，等权持有前N只股票")
+
+    with st.sidebar:
+        st.header("⚙️ 股票池设置")
+        st.caption("先用基本面条件圈定股票池，再用动量因子每月选股")
+        fac_pe_max   = st.slider("PE上限",   10, 60,  35, 1)
+        fac_pb_max   = st.slider("PB上限",    2, 15,   8, 1)
+        fac_cap_min  = st.slider("市值下限(亿)", 50, 500, 100, 50)
+        fac_cap_max  = st.slider("市值上限(亿)", 500, 10000, 3000, 500)
+        fac_max_pool = st.slider("最多下载只数", 20, 80, 40, 10,
+                                  help="只数越多越准确，但下载越慢")
+
+        st.divider()
+        st.header("📅 回测参数")
+        fac_start    = st.text_input("开始日期", value="20190101")
+        fac_end      = st.text_input("结束日期", value="20241231")
+        fac_n        = st.slider("每月持仓只数", 5, 40, 20, 5)
+
+        st.divider()
+        st.header("🔬 WFV 验证")
+        fac_wfv      = st.checkbox("同时做样本外验证", value=True)
+        fac_train_end = st.text_input("训练集截止", value="20221231")
+        fac_test_start = st.text_input("测试集起始", value="20230101")
+
+        run_fac = st.button("🚀 开始回测", type="primary", use_container_width=True)
+
+    if run_fac:
+
+        # ── Step1：获取股票池 ──
+        with st.status("📥 获取全市场基本面数据...", expanded=True) as sts:
+            try:
+                df_all   = get_fundamental_data()
+                df_screen = screen_stocks(df_all,
+                                          pe_max=fac_pe_max, pb_min=0.5,
+                                          pb_max=fac_pb_max,
+                                          cap_min=fac_cap_min,
+                                          cap_max=fac_cap_max,
+                                          ret_60d_min=-50)
+                pool_codes = df_screen["code"].tolist()[:fac_max_pool]
+                st.write(f"✅ 筛出 {len(pool_codes)} 只股票（取前{fac_max_pool}只）")
+                sts.update(label=f"股票池：{len(pool_codes)} 只", state="complete")
+            except Exception as e:
+                sts.update(label=f"获取失败：{e}", state="error")
+                st.stop()
+
+        # ── Step2：批量下载历史价格 ──
+        progress_bar = st.progress(0, text="下载历史价格中...")
+        price_data = {}
+        for idx, code in enumerate(pool_codes):
+            try:
+                prefix = "sh" if code.startswith("6") else "sz"
+                df_tmp = ak.stock_zh_a_daily(symbol=f"{prefix}{code}", adjust="qfq")
+                df_tmp["date"] = pd.to_datetime(df_tmp["date"])
+                df_tmp = df_tmp[(df_tmp["date"] >= pd.to_datetime(fac_start)) &
+                                (df_tmp["date"] <= pd.to_datetime(fac_end))]
+                df_tmp.set_index("date", inplace=True)
+                if len(df_tmp) > 120:
+                    price_data[code] = df_tmp["close"]
+            except:
+                pass
+            time.sleep(0.3)
+            progress_bar.progress((idx + 1) / len(pool_codes),
+                                   text=f"下载中 {idx+1}/{len(pool_codes)}：{code}")
+
+        progress_bar.empty()
+        st.success(f"✅ 成功下载 {len(price_data)} 只股票数据")
+
+        if len(price_data) < 5:
+            st.error("有效股票数量过少，请调整筛选条件或扩大股票池")
+            st.stop()
+
+        # ── Step3：全样本回测 ──
+        with st.status("📊 运行月度因子回测...", expanded=True) as sts:
+            nav_full, rebal_log, rebal_df = backtest_factor_monthly(
+                price_data, fac_start, fac_end, fac_n
+            )
+            if nav_full.empty:
+                sts.update(label="回测失败，数据不足", state="error")
+                st.stop()
+            sts.update(label="回测完成", state="complete")
+
+        # ── 绩效指标 ──
+        total_ret = (nav_full.iloc[-1] / 1_000_000 - 1) * 100
+        dr        = nav_full.pct_change().dropna()
+        sharpe    = dr.mean() / dr.std() * np.sqrt(252) if dr.std() > 0 else 0
+        max_dd    = ((nav_full - nav_full.cummax()) / nav_full.cummax()).min() * 100
+        n_rebal   = len(rebal_log)
+
+        st.subheader("📊 全样本回测结果")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("总收益率",   f"{total_ret:.1f}%")
+        c2.metric("夏普比率",   f"{sharpe:.3f}")
+        c3.metric("最大回撤",   f"{max_dd:.1f}%")
+        c4.metric("换仓次数",   f"{n_rebal} 次")
+
+        # ── 图表 ──
+        benchmark = get_benchmark(fac_start, fac_end)
+        img_bytes = plot_factor_result(nav_full, benchmark, rebal_df, fac_n)
+        st.image(img_bytes, use_container_width=True)
+
+        # ── 换仓记录 ──
+        with st.expander("📋 换仓记录（最近10次）"):
+            if not rebal_df.empty:
+                st.dataframe(rebal_df.tail(10), hide_index=True,
+                             use_container_width=True)
+
+        # ── WFV 验证 ──
+        if fac_wfv:
+            st.divider()
+            st.subheader("🔬 样本外验证（简单切割）")
+
+            train_data = {c: ps[ps.index <= fac_train_end]
+                          for c, ps in price_data.items()}
+            test_data  = {c: ps[ps.index >= fac_test_start]
+                          for c, ps in price_data.items()}
+
+            with st.spinner("运行训练集回测..."):
+                nav_train, _, _ = backtest_factor_monthly(
+                    train_data, fac_start, fac_train_end, fac_n)
+            with st.spinner("运行测试集回测..."):
+                nav_test, _, _ = backtest_factor_monthly(
+                    test_data, fac_test_start, fac_end, fac_n)
+
+            if not nav_train.empty and not nav_test.empty:
+                dr_train  = nav_train.pct_change().dropna()
+                dr_test   = nav_test.pct_change().dropna()
+                sh_train  = (dr_train.mean() / dr_train.std() * np.sqrt(252)
+                             if dr_train.std() > 0 else 0)
+                sh_test   = (dr_test.mean()  / dr_test.std()  * np.sqrt(252)
+                             if dr_test.std()  > 0 else 0)
+                ret_train = (nav_train.iloc[-1] / 1_000_000 - 1) * 100
+                ret_test  = (nav_test.iloc[-1]  / 1_000_000 - 1) * 100
+                decay     = sh_test / sh_train if sh_train > 0 else 0
+
+                cc1, cc2, cc3, cc4 = st.columns(4)
+                cc1.metric("训练集夏普", f"{sh_train:.3f}")
+                cc2.metric("测试集夏普", f"{sh_test:.3f}",
+                            delta=f"{sh_test-sh_train:+.3f}")
+                cc3.metric("训练集收益", f"{ret_train:.1f}%")
+                cc4.metric("测试集收益", f"{ret_test:.1f}%",
+                            delta=f"{ret_test-ret_train:+.1f}%")
+
+                if decay > 0.7:
+                    st.success(f"夏普衰减比 {decay:.2f}  ✅ 健壮——因子在样本外依然有效")
+                elif decay > 0.4:
+                    st.warning(f"夏普衰减比 {decay:.2f}  ⚠️ 一般——有一定样本外有效性")
+                elif sh_test > 0:
+                    st.warning(f"夏普衰减比 {decay:.2f}  ⚠️ 衰减较大，但样本外仍为正")
+                else:
+                    st.error(f"夏普衰减比 {decay:.2f}  ❌ 样本外为负——需进一步改进")
+
+                st.caption("💡 与双均线相比，月度因子策略的样本外衰减通常更小，"
+                           "因为换手率低、信号来自价格动量（有学术依据）")
+
+    else:
+        st.info("👈 在左侧设置参数，点击「开始回测」")
+        st.markdown("""
+**策略逻辑说明：**
+
+每个月末，对股票池里所有股票计算一个综合得分：
+
+```
+动量得分 = 12个月前价格 → 1个月前价格的涨幅（跳过最近1月）
+趋势过滤 = 当前价格 > 60日均线（否则得分清零）
+最终得分 = 动量百分位排名 × 趋势过滤
+```
+
+选出得分前N只，等权持有到下月末，循环。
+
+**与双均线策略的核心区别：**
+- 换手率：每年约12次 vs 30-40次，手续费大幅降低
+- 分散性：20只等权 vs 单股，风险更分散
+- 信号来源：12个月动量在A股有学术支持，IC约0.04~0.08
+""")
 
 # =========================================================================
 # 页面二：策略验证（Walk-Forward）
