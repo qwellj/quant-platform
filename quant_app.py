@@ -685,21 +685,37 @@ def backtest_factor_monthly(price_data: dict,
                              start_date: str,
                              end_date:   str,
                              n_stocks:   int   = 20,
-                             initial_cash: float = 1_000_000) -> tuple:
+                             initial_cash: float = 1_000_000,
+                             market_filter: bool = False,
+                             market_ma: int = 60) -> tuple:
     """
     月度调仓因子回测引擎
 
-    逻辑：
-        每个月末 → 计算因子得分 → 选前n_stocks只
-        → 卖掉不在新选股里的 → 买入新增股票（等权）
-        → 持有到下月末 → 循环
+    新增参数：
+        market_filter : 市场环境过滤开关
+                        True = 每月末判断沪深300是否在MA上方
+                        若沪深300 < MA(market_ma) → 全部空仓，不持股
+                        若沪深300 > MA(market_ma) → 正常选股持仓
+        market_ma     : 市场过滤均线周期（默认60日）
 
-    手续费：买入0.1%，卖出0.1%（含印花税）
-    持仓：等权，即每只股票分配相同金额
-
-    注意：月度换仓每年约12次，远少于均线策略的30-40次
-    换手率低 → 手续费少 → 策略净收益更真实
+    原理：
+        趋势跟踪类策略在熊市会系统性失效（动量反转）
+        当大盘本身处于下跌趋势时，个股动量因子的有效性大幅下降
+        空仓等待比持仓被套更划算
+        预期效果：最大回撤从 -41% 降至 -20% ~ -25%
+                  代价是牛市初期均线修复阶段会少赚 5-10%
     """
+    # 下载沪深300数据（用于市场过滤）
+    bm_series = None
+    if market_filter:
+        try:
+            bm_df = ak.stock_zh_index_daily(symbol="sh000300")
+            bm_df["date"] = pd.to_datetime(bm_df["date"])
+            bm_df.set_index("date", inplace=True)
+            bm_series = bm_df["close"]
+        except:
+            market_filter = False   # 下载失败则关闭过滤，不影响回测
+
     # 生成月末再平衡日期序列
     all_month_ends = pd.date_range(start_date, end_date, freq="ME")
     if len(all_month_ends) < 3:
@@ -717,12 +733,23 @@ def backtest_factor_monthly(price_data: dict,
         rebal_date = all_month_ends[i]
         next_date  = all_month_ends[i + 1]
 
-        # ── 当月末：计算得分，决定新持仓 ──
-        scores = score_stocks_at_date(price_data, rebal_date)
-        if scores.empty:
-            continue
+        # ── 市场环境判断 ──
+        # 沪深300当前价格 vs MA(market_ma)
+        # 若大盘在均线以下 → market_ok = False → 全部空仓
+        market_ok = True
+        if market_filter and bm_series is not None:
+            bm_hist = bm_series[bm_series.index <= rebal_date].dropna()
+            if len(bm_hist) >= market_ma:
+                bm_ma  = bm_hist.rolling(market_ma).mean().iloc[-1]
+                bm_now = bm_hist.iloc[-1]
+                market_ok = (bm_now > bm_ma)
 
-        new_selection = scores.head(n_stocks).index.tolist()
+        # ── 当月末：计算得分，决定新持仓 ──
+        if market_ok:
+            scores = score_stocks_at_date(price_data, rebal_date)
+            new_selection = scores.head(n_stocks).index.tolist() if not scores.empty else []
+        else:
+            new_selection = []   # 大盘不健康 → 空仓
 
         # 卖出不在新选股里的（月末收盘价成交）
         to_sell = [c for c in list(holdings.keys()) if c not in new_selection]
@@ -736,8 +763,8 @@ def backtest_factor_monthly(price_data: dict,
             del holdings[code]
 
         # 买入新增的股票（等权分配剩余现金）
-        to_buy   = [c for c in new_selection if c not in holdings]
-        n_buy    = len(to_buy)
+        to_buy = [c for c in new_selection if c not in holdings]
+        n_buy  = len(to_buy)
         if n_buy > 0 and cash > 1000:
             per_amt = cash * 0.99 / n_buy     # 留1%现金缓冲
             for code in to_buy:
@@ -756,9 +783,11 @@ def backtest_factor_monthly(price_data: dict,
                         cash -= cost
                         holdings[code] = shares
 
-        # 记录换仓情况
+        # 记录换仓情况（加入市场状态）
+        market_status = "✅ 持仓" if market_ok else "⏸ 空仓（大盘弱）"
         rebal_log.append({
             "换仓日":   rebal_date.strftime("%Y-%m"),
+            "市场状态": market_status,
             "新选股":   ", ".join(new_selection[:5]) + ("..." if len(new_selection) > 5 else ""),
             "持仓只数": len(holdings),
             "现金余额": round(cash, 0),
@@ -779,7 +808,7 @@ def backtest_factor_monthly(price_data: dict,
     if not nav_records:
         return pd.Series(dtype=float), rebal_log, pd.DataFrame()
 
-    nav_s   = pd.DataFrame(nav_records).set_index("date")["nav"]
+    nav_s    = pd.DataFrame(nav_records).set_index("date")["nav"]
     rebal_df = pd.DataFrame(rebal_log)
     return nav_s, rebal_log, rebal_df
 
@@ -1191,8 +1220,8 @@ def technical_screen(code, window=20):
 # =============================================================================
 
 st.set_page_config(page_title="量化投资分析平台", page_icon="📈", layout="wide")
-st.title("📈 量化投资分析平台 v6.0")
-st.caption("策略回测 · Walk-Forward验证 · 月度因子回测 · 基本面选股 · PDF报告导出")
+st.title("📈 量化投资分析平台 v7.0")
+st.caption("策略回测 · Walk-Forward验证 · 月度因子回测（市场过滤） · 基本面选股 · PDF报告导出")
 
 # 顶部页面导航
 page = st.radio("", ["📊 策略回测", "🔬 策略验证(WFV)", "📅 因子回测", "🔍 基本面选股"], horizontal=True, label_visibility="collapsed")
@@ -1614,6 +1643,14 @@ elif page == "📅 因子回测":
         fac_n        = st.slider("每月持仓只数", 5, 40, 20, 5)
 
         st.divider()
+        st.header("🌍 市场环境过滤")
+        fac_mkt_filter = st.checkbox("启用大盘过滤", value=True,
+                                      help="沪深300跌破MA时全部空仓，减少熊市回撤")
+        fac_mkt_ma     = st.slider("大盘均线周期", 20, 120, 60, 10,
+                                    disabled=not fac_mkt_filter,
+                                    help="默认60日，沪深300低于此均线则空仓")
+
+        st.divider()
         st.header("🔬 WFV 验证")
         fac_wfv      = st.checkbox("同时做样本外验证", value=True)
         fac_train_end = st.text_input("训练集截止", value="20221231")
@@ -1669,7 +1706,8 @@ elif page == "📅 因子回测":
         # ── Step3：全样本回测 ──
         with st.status("📊 运行月度因子回测...", expanded=True) as sts:
             nav_full, rebal_log, rebal_df = backtest_factor_monthly(
-                price_data, fac_start, fac_end, fac_n
+                price_data, fac_start, fac_end, fac_n,
+                market_filter=fac_mkt_filter, market_ma=fac_mkt_ma
             )
             if nav_full.empty:
                 sts.update(label="回测失败，数据不足", state="error")
@@ -1683,12 +1721,19 @@ elif page == "📅 因子回测":
         max_dd    = ((nav_full - nav_full.cummax()) / nav_full.cummax()).min() * 100
         n_rebal   = len(rebal_log)
 
+        # 统计空仓月份数
+        n_empty = sum(1 for r in rebal_log if "空仓" in r.get("市场状态", ""))
+
         st.subheader("📊 全样本回测结果")
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("总收益率",   f"{total_ret:.1f}%")
         c2.metric("夏普比率",   f"{sharpe:.3f}")
         c3.metric("最大回撤",   f"{max_dd:.1f}%")
         c4.metric("换仓次数",   f"{n_rebal} 次")
+
+        if fac_mkt_filter and n_empty > 0:
+            st.info(f"🌍 市场过滤已启用：共触发 **{n_empty}** 个月空仓"
+                    f"（占总月份 {n_empty/n_rebal:.0%}）")
 
         # ── 图表 ──
         benchmark = get_benchmark(fac_start, fac_end)
@@ -1713,10 +1758,12 @@ elif page == "📅 因子回测":
 
             with st.spinner("运行训练集回测..."):
                 nav_train, _, _ = backtest_factor_monthly(
-                    train_data, fac_start, fac_train_end, fac_n)
+                    train_data, fac_start, fac_train_end, fac_n,
+                    market_filter=fac_mkt_filter, market_ma=fac_mkt_ma)
             with st.spinner("运行测试集回测..."):
                 nav_test, _, _ = backtest_factor_monthly(
-                    test_data, fac_test_start, fac_end, fac_n)
+                    test_data, fac_test_start, fac_end, fac_n,
+                    market_filter=fac_mkt_filter, market_ma=fac_mkt_ma)
 
             if not nav_train.empty and not nav_test.empty:
                 dr_train  = nav_train.pct_change().dropna()
