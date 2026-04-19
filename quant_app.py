@@ -681,6 +681,149 @@ def score_stocks_at_date(price_data: dict, rebal_date: pd.Timestamp) -> pd.DataF
     return df.sort_values("score", ascending=False)
 
 
+def generate_monthly_report(price_data: dict,
+                             stock_name_map: dict,
+                             n_stocks: int,
+                             report_date: pd.Timestamp = None) -> tuple:
+    """
+    生成本月选股报告
+
+    返回：
+        df_report  : 完整选股 DataFrame（含排名、代码、名称、动量、趋势、当前价格）
+        df_top     : 前 n_stocks 只（实际持仓）
+        report_date: 报告日期
+    """
+    if report_date is None:
+        report_date = pd.Timestamp.today().normalize()
+
+    # 找最近有数据的交易日
+    all_dates = sorted(set(
+        d for ps in price_data.values() for d in ps.index
+    ))
+    valid_dates = [d for d in all_dates if d <= report_date]
+    if not valid_dates:
+        return pd.DataFrame(), pd.DataFrame(), report_date
+    actual_date = max(valid_dates)
+
+    scores = score_stocks_at_date(price_data, actual_date)
+    if scores.empty:
+        return pd.DataFrame(), pd.DataFrame(), actual_date
+
+    # 获取当前价格和近1月涨跌
+    records = []
+    for rank, (code, row) in enumerate(scores.iterrows(), 1):
+        ps   = price_data.get(code)
+        if ps is None:
+            continue
+        ps_hist    = ps[ps.index <= actual_date].dropna()
+        cur_price  = round(float(ps_hist.iloc[-1]), 2) if len(ps_hist) > 0 else None
+        # 近1个月涨跌（用于参考，不参与评分）
+        ret_1m = None
+        if len(ps_hist) >= 22:
+            ret_1m = round((ps_hist.iloc[-1] / ps_hist.iloc[-22] - 1) * 100, 1)
+
+        records.append({
+            "排名":       rank,
+            "股票代码":   code,
+            "股票名称":   stock_name_map.get(code, "—"),
+            "动量得分":   round(float(row["momentum"]) * 100, 1),
+            "趋势向上":   "✅" if row["trend"] == 1 else "❌",
+            "近1月涨跌%": ret_1m,
+            "当前价格":   cur_price,
+            "是否入选":   "★ 入选" if rank <= n_stocks else "",
+        })
+
+    df_report = pd.DataFrame(records)
+    df_top    = df_report[df_report["排名"] <= n_stocks].copy()
+    return df_report, df_top, actual_date
+
+
+def build_excel_report(df_top: pd.DataFrame,
+                        df_all: pd.DataFrame,
+                        nav_s: pd.Series,
+                        report_date: pd.Timestamp,
+                        n_stocks: int,
+                        total_ret: float,
+                        sharpe: float,
+                        max_dd: float) -> bytes:
+    """
+    生成 Excel 报告（三个 sheet）
+      Sheet1：本月持仓（Top N）
+      Sheet2：全部候选股票评分
+      Sheet3：策略绩效摘要 + 年度收益
+    """
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+
+        # ── Sheet1：本月持仓 ──
+        df_top_out = df_top[[
+            "排名", "股票代码", "股票名称",
+            "动量得分", "趋势向上", "近1月涨跌%", "当前价格"
+        ]].copy()
+        df_top_out.to_excel(writer, sheet_name="本月持仓", index=False)
+
+        # 格式美化
+        ws1 = writer.sheets["本月持仓"]
+        ws1.column_dimensions["A"].width = 6
+        ws1.column_dimensions["B"].width = 12
+        ws1.column_dimensions["C"].width = 14
+        ws1.column_dimensions["D"].width = 12
+        ws1.column_dimensions["E"].width = 10
+        ws1.column_dimensions["F"].width = 12
+        ws1.column_dimensions["G"].width = 10
+        # 标题行加背景色
+        from openpyxl.styles import PatternFill, Font, Alignment
+        header_fill = PatternFill("solid", fgColor="1D6A3A")
+        header_font = Font(color="FFFFFF", bold=True)
+        for cell in ws1[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center")
+
+        # ── Sheet2：全部候选 ──
+        df_all_out = df_all[[
+            "排名", "股票代码", "股票名称",
+            "动量得分", "趋势向上", "近1月涨跌%", "当前价格", "是否入选"
+        ]].copy()
+        df_all_out.to_excel(writer, sheet_name="全部候选评分", index=False)
+        ws2 = writer.sheets["全部候选评分"]
+        for cell in ws2[1]:
+            cell.fill = PatternFill("solid", fgColor="1A4A7A")
+            cell.font = Font(color="FFFFFF", bold=True)
+            cell.alignment = Alignment(horizontal="center")
+        ws2.column_dimensions["B"].width = 12
+        ws2.column_dimensions["C"].width = 14
+
+        # ── Sheet3：绩效摘要 ──
+        summary_rows = [
+            ["报告日期",   report_date.strftime("%Y-%m-%d")],
+            ["持仓只数",   n_stocks],
+            ["策略总收益", f"{total_ret:.1f}%"],
+            ["夏普比率",   f"{sharpe:.3f}"],
+            ["最大回撤",   f"{max_dd:.1f}%"],
+            ["", ""],
+            ["年度收益", ""],
+        ]
+        # 逐年计算
+        for yr in sorted(nav_s.index.year.unique()):
+            yr_nav = nav_s[nav_s.index.year == yr]
+            if len(yr_nav) > 2:
+                ret = round((yr_nav.iloc[-1] / yr_nav.iloc[0] - 1) * 100, 1)
+                summary_rows.append([str(yr), f"{ret}%"])
+
+        df_summary = pd.DataFrame(summary_rows, columns=["指标", "数值"])
+        df_summary.to_excel(writer, sheet_name="绩效摘要", index=False)
+        ws3 = writer.sheets["绩效摘要"]
+        ws3.column_dimensions["A"].width = 16
+        ws3.column_dimensions["B"].width = 14
+        for cell in ws3[1]:
+            cell.fill = PatternFill("solid", fgColor="4A3A8A")
+            cell.font = Font(color="FFFFFF", bold=True)
+
+    buf.seek(0)
+    return buf.read()
+
+
 def backtest_factor_monthly(price_data: dict,
                              start_date: str,
                              end_date:   str,
@@ -1220,8 +1363,8 @@ def technical_screen(code, window=20):
 # =============================================================================
 
 st.set_page_config(page_title="量化投资分析平台", page_icon="📈", layout="wide")
-st.title("📈 量化投资分析平台 v7.0")
-st.caption("策略回测 · Walk-Forward验证 · 月度因子回测（市场过滤） · 基本面选股 · PDF报告导出")
+st.title("📈 量化投资分析平台 v8.0")
+st.caption("策略回测 · Walk-Forward验证 · 月度因子回测 · 本月选股报告 · 基本面选股 · PDF导出")
 
 # 顶部页面导航
 page = st.radio("", ["📊 策略回测", "🔬 策略验证(WFV)", "📅 因子回测", "🔍 基本面选股"], horizontal=True, label_visibility="collapsed")
@@ -1745,6 +1888,52 @@ elif page == "📅 因子回测":
             if not rebal_df.empty:
                 st.dataframe(rebal_df.tail(10), hide_index=True,
                              use_container_width=True)
+
+        # ── 本月选股报告 ──
+        st.divider()
+        st.subheader("📄 本月选股报告")
+        st.caption("基于最新数据实时计算，生成可追踪的 Excel 持仓报告")
+
+        with st.spinner("计算本月选股得分..."):
+            # 获取股票名称映射
+            name_map = {}
+            for _, row in df_screen.iterrows():
+                name_map[row["code"]] = row["name"]
+
+            today_ts = pd.Timestamp.today().normalize()
+            df_report_all, df_report_top, rpt_date = generate_monthly_report(
+                price_data, name_map, fac_n, today_ts
+            )
+
+        if df_report_top.empty:
+            st.warning("数据不足，无法生成报告")
+        else:
+            st.success(f"✅ 本月持仓报告已生成（基准日期：{rpt_date.strftime('%Y-%m-%d')}）")
+
+            # 展示本月 Top N
+            st.markdown(f"**本月入选 {fac_n} 只股票：**")
+            show_cols = ["排名", "股票代码", "股票名称",
+                         "动量得分", "趋势向上", "近1月涨跌%", "当前价格"]
+            st.dataframe(
+                df_report_top[show_cols],
+                hide_index=True,
+                use_container_width=True
+            )
+
+            # 生成 Excel 并提供下载
+            excel_bytes = build_excel_report(
+                df_report_top, df_report_all, nav_full,
+                rpt_date, fac_n, total_ret, sharpe, max_dd
+            )
+            month_str = rpt_date.strftime("%Y%m")
+            st.download_button(
+                label=f"⬇️ 下载 {month_str} 选股报告 Excel",
+                data=excel_bytes,
+                file_name=f"factor_report_{month_str}_top{fac_n}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary"
+            )
+            st.caption("Excel 包含三个 Sheet：本月持仓 · 全部候选评分 · 策略绩效摘要")
 
         # ── WFV 验证 ──
         if fac_wfv:
